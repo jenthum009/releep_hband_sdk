@@ -1,0 +1,98 @@
+group = "com.releep.releep_hband_sdk"
+version = "1.0-SNAPSHOT"
+
+buildscript {
+    ext.kotlin_version = "2.2.20"
+    repositories {
+        google()
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath("com.android.tools.build:gradle:8.11.1")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version")
+    }
+}
+
+// The Veepoo SDK ships as local .aar files. A library module cannot depend on
+// local .aar files directly, so they are published into a file-based Maven
+// repo inside the plugin (android/libs-maven). Every project in the host build
+// must see that repo, because the app module resolves the plugin's
+// dependencies transitively.
+def veepooRepo = new File(projectDir, "libs-maven").toURI()
+rootProject.allprojects {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url = veepooRepo }
+    }
+}
+
+apply plugin: "com.android.library"
+apply plugin: "kotlin-android"
+
+android {
+    namespace = "com.releep.releep_hband_sdk"
+
+    compileSdk = 36
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = JavaVersion.VERSION_17
+    }
+
+    sourceSets {
+        main.java.srcDirs += "src/main/kotlin"
+        test.java.srcDirs += "src/test/kotlin"
+    }
+
+    defaultConfig {
+        minSdk = 24
+        consumerProguardFiles "consumer-rules.pro"
+    }
+
+    dependencies {
+        // Veepoo protocol + bluetooth (required)
+        api("com.veepoo.sdk:vpprotocol:2.3.85.15@aar")
+        api("com.veepoo.sdk:vpbluetooth:1.20@aar")
+        // JieLi chip protocol (required)
+        implementation("com.veepoo.sdk:jl-watch:1.13.1@aar")
+        implementation("com.veepoo.sdk:jl-rcsp:0.7.2@aar")
+        implementation("com.veepoo.sdk:jl-bt-ota:1.10.0@aar")
+        implementation("com.veepoo.sdk:bmpconvert:1.6.0@aar")
+        // Bluetrum chip protocol (required)
+        implementation("com.veepoo.sdk:abpartool:1.0@aar")
+        // Goodix upgrade libs (optional in the SDK docs, kept for completeness)
+        implementation("com.veepoo.sdk:libcomx:0.5@jar")
+        implementation("com.veepoo.sdk:libble:0.5@aar")
+        implementation("com.veepoo.sdk:libdfu:1.5@aar")
+        implementation("com.veepoo.sdk:libfastdfu:0.5@aar")
+
+        // Maven dependencies required by the Veepoo SDK
+        implementation("com.google.code.gson:gson:2.10.1")
+        implementation("no.nordicsemi.android:mcumgr-core:2.7.4")
+        implementation("no.nordicsemi.android:mcumgr-ble:2.7.4")
+        implementation("no.nordicsemi.android.support.v18:scanner:1.4.2")
+        implementation("androidx.localbroadcastmanager:localbroadcastmanager:1.1.0")
+        implementation("androidx.core:core-ktx:1.13.1")
+
+        testImplementation("org.jetbrains.kotlin:kotlin-test")
+        testImplementation("org.mockito:mockito-core:5.0.0")
+    }
+
+    testOptions {
+        unitTests.all {
+            useJUnitPlatform()
+
+            testLogging {
+               events "passed", "skipped", "failed", "standardOut", "standardError"
+               outputs.upToDateWhen {false}
+               showStandardStreams = true
+            }
+        }
+    }
+}

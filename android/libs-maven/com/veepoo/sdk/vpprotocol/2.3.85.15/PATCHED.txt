@@ -1,0 +1,1 @@
+NOTE: vpprotocol AAR manifest patched (removed allowBackup/label/supportsRtl from <application>)

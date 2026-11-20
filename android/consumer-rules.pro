@@ -1,0 +1,12 @@
+# Veepoo / HBand SDK — the SDK uses reflection + Gson models; keep it intact.
+-keep class com.veepoo.** { *; }
+-keep class com.inuker.** { *; }
+-keep class com.jieli.** { *; }
+-keep class com.bluetrum.** { *; }
+-keep class com.goodix.** { *; }
+-keep class no.nordicsemi.** { *; }
+-dontwarn com.veepoo.**
+-dontwarn com.inuker.**
+-dontwarn com.jieli.**
+-dontwarn com.bluetrum.**
+-dontwarn com.goodix.**

@@ -1,0 +1,663 @@
+package com.releep.releep_hband_sdk.health
+
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import com.releep.releep_hband_sdk.core.WatchSession
+import com.releep.releep_hband_sdk.health.HealthRecords.BATTERY
+import com.releep.releep_hband_sdk.health.HealthRecords.BLOOD_GLUCOSE
+import com.releep.releep_hband_sdk.health.HealthRecords.BLOOD_PRESSURE
+import com.releep.releep_hband_sdk.health.HealthRecords.BODY_TEMP
+import com.releep.releep_hband_sdk.health.HealthRecords.CALORIE
+import com.releep.releep_hband_sdk.health.HealthRecords.ECG
+import com.releep.releep_hband_sdk.health.HealthRecords.HEART_RATE
+import com.releep.releep_hband_sdk.health.HealthRecords.HEART_WARNING
+import com.releep.releep_hband_sdk.health.HealthRecords.HRV
+import com.releep.releep_hband_sdk.health.HealthRecords.OFFLINE
+import com.releep.releep_hband_sdk.health.HealthRecords.ONLINE
+import com.releep.releep_hband_sdk.health.HealthRecords.RESPIRATORY
+import com.releep.releep_hband_sdk.health.HealthRecords.RR_INTERVAL
+import com.releep.releep_hband_sdk.health.HealthRecords.SLEEP
+import com.releep.releep_hband_sdk.health.HealthRecords.STRESS
+import com.releep.releep_hband_sdk.health.HealthRecords.SPO2
+import com.releep.releep_hband_sdk.health.HealthRecords.SPORT
+import com.releep.releep_hband_sdk.health.HealthRecords.STEP_COUNT
+import com.veepoo.protocol.VPOperateManager
+import com.veepoo.protocol.listener.base.IBleWriteResponse
+import com.veepoo.protocol.listener.data.IECGReadDataListener
+import com.veepoo.protocol.listener.data.IHeartWaringDataListener
+import com.veepoo.protocol.listener.data.IOriginData3Listener
+import com.veepoo.protocol.listener.data.IOriginDataListener
+import com.veepoo.protocol.listener.data.IRRIntervalProgressListener
+import com.veepoo.protocol.listener.data.ISleepDataListener
+import com.veepoo.protocol.listener.data.ISportModelOriginListener
+import com.veepoo.protocol.listener.data.ITemptureDataListener
+import com.veepoo.protocol.model.DayState
+import com.veepoo.protocol.model.datas.EcgDetectResult
+import com.veepoo.protocol.model.datas.EcgDiagnosis
+import com.veepoo.protocol.model.datas.HRVOriginData
+import com.veepoo.protocol.model.datas.OriginData
+import com.veepoo.protocol.model.datas.OriginData3
+import com.veepoo.protocol.model.datas.OriginHalfHourData
+import com.veepoo.protocol.model.datas.RRIntervalData
+import com.veepoo.protocol.model.datas.SleepData
+import com.veepoo.protocol.model.datas.SleepPrecisionData
+import com.veepoo.protocol.model.datas.SportModelGPSWatchOriginHeadData
+import com.veepoo.protocol.model.datas.SportModelOriginHeadData
+import com.veepoo.protocol.model.datas.SportModelOriginItemData
+import com.veepoo.protocol.model.datas.Spo2hOriginData
+import com.veepoo.protocol.model.datas.TemptureData
+import com.veepoo.protocol.model.datas.TimeData
+import com.veepoo.protocol.model.enums.EBloodGlucoseRiskLevel
+import com.veepoo.protocol.model.enums.EECGResultType
+import com.veepoo.protocol.model.settings.ReadOriginSetting
+import com.veepoo.protocol.shareprence.VpSpGetUtil
+
+/**
+ * Reads the watch history step by step and turns it into backend records.
+ *
+ * The Veepoo SDK cannot run two commands at once, so the steps run strictly
+ * one after another. Every step has a timeout and is skipped when the
+ * watch does not support it; failures are reported per step and never abort
+ * the whole sync.
+ *
+ * Callbacks ([onProgress], [onDone]) are delivered on the main thread.
+ */
+class HealthSync(
+    private val context: Context,
+    private val days: Int,
+    private val types: Set<String>,
+    private val onProgress: (Map<String, Any?>) -> Unit,
+    private val onDone: (Map<String, Any?>) -> Unit,
+) {
+    private val main = Handler(Looper.getMainLooper())
+    private val manager = VPOperateManager.getInstance()
+    private val sp = VpSpGetUtil.getVpSpVariInstance(context)
+    private val bag = RecordBag()
+    private val errors = LinkedHashMap<String, String>()
+    private val skipped = ArrayList<String>()
+    private var batteryPercent: Int? = null
+    private var cancelled = false
+    private var ended = false
+    private var stepTimeout: Runnable? = null
+    private var stepIndex = 0
+    private val started = System.currentTimeMillis()
+
+    private class Step(
+        val name: String,
+        val timeoutMs: Long,
+        val wanted: Set<String>,
+        val supported: () -> Boolean,
+        val run: (done: (String?) -> Unit) -> Unit,
+    )
+
+    private val watchDays: Int
+        get() = WatchSession.watchDays(context).coerceAtLeast(1)
+
+    private val readDays: Int
+        get() = days.coerceIn(1, watchDays)
+
+    private val steps: List<Step> = listOf(
+        Step("battery", 10_000, setOf(BATTERY, STEP_COUNT, CALORIE), { true }, ::readBattery),
+        Step("steps", 10_000, setOf(STEP_COUNT, CALORIE), { true }, ::readCurrentSteps),
+        Step(
+            "daily", 180_000,
+            setOf(HEART_RATE, BLOOD_PRESSURE, SPO2, RESPIRATORY, HRV, STEP_COUNT, CALORIE, BODY_TEMP, BLOOD_GLUCOSE, HEART_WARNING, STRESS),
+            { true }, ::readDaily,
+        ),
+        Step("sleep", 90_000, setOf(SLEEP), { true }, ::readSleep),
+        Step(
+            "temperature", 90_000, setOf(BODY_TEMP),
+            { sp.isSupportReadTempture && sp.temperatureType != 5 }, ::readTemperature,
+        ),
+        Step("rrinterval", 120_000, setOf(RR_INTERVAL), { true }, ::readRrInterval),
+        Step("sport", 90_000, setOf(SPORT), { sp.isSupportSportModel }, ::readSport),
+        Step("ecg", 90_000, setOf(ECG), { sp.isSupportECG }, ::readEcg),
+        Step("heartwarning", 10_000, setOf(HEART_WARNING), { true }, ::readHeartWarning),
+    )
+
+    fun start() = main.post { next() }
+
+    fun cancel() {
+        cancelled = true
+    }
+
+    /**
+     * The watch link dropped: stop now with what was read so far instead of
+     * waiting for every remaining step to time out (minutes of `BUSY`).
+     */
+    fun abort(reason: String) = main.post {
+        if (ended) return@post
+        stepTimeout?.let { main.removeCallbacks(it) }
+        errors["link"] = reason
+        finish(cancelledByUser = false)
+    }
+
+    // ------------------------------------------------------------------
+
+    private fun next() {
+        if (ended) return
+        if (cancelled) return finish(cancelledByUser = true)
+        if (stepIndex >= steps.size) return finish(cancelledByUser = false)
+        val step = steps[stepIndex++]
+        if (step.wanted.none { it in types }) return next()
+        if (safe { step.supported() } != true) {
+            skipped += step.name
+            return next()
+        }
+        progress(step.name, null)
+        var answered = false
+        val timeout = Runnable {
+            if (!answered) {
+                answered = true
+                errors[step.name] = "timeout"
+                next()
+            }
+        }
+        stepTimeout = timeout
+        main.postDelayed(timeout, step.timeoutMs)
+        try {
+            step.run { error ->
+                main.post {
+                    if (answered) return@post
+                    answered = true
+                    main.removeCallbacks(timeout)
+                    if (error != null) errors[step.name] = error
+                    // Short gap: the SDK needs a moment between commands.
+                    main.postDelayed({ next() }, 150)
+                }
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "step ${step.name} failed: $e")
+            if (!answered) {
+                answered = true
+                main.removeCallbacks(timeout)
+                errors[step.name] = e.message ?: e.javaClass.simpleName
+                next()
+            }
+        }
+    }
+
+    private fun progress(stage: String, fraction: Float?) {
+        val stageIndex = steps.indexOfFirst { it.name == stage }.coerceAtLeast(0)
+        val overall = (stageIndex + (fraction ?: 0f).coerceIn(0f, 1f)) / steps.size
+        main.post {
+            onProgress(
+                mapOf(
+                    "kind" to "sync",
+                    "stage" to stage,
+                    "stageProgress" to fraction?.toDouble(),
+                    "progress" to overall.toDouble(),
+                )
+            )
+        }
+    }
+
+    private fun finish(cancelledByUser: Boolean) {
+        if (ended) return
+        ended = true
+        val records = bag.toMap().filterKeys { it in types }
+        onDone(
+            mapOf(
+                "success" to (errors.isEmpty() && !cancelledByUser),
+                "cancelled" to cancelledByUser,
+                "records" to records,
+                "counts" to records.mapValues { it.value.size },
+                "errors" to errors,
+                "skipped" to skipped,
+                "durationMs" to (System.currentTimeMillis() - started),
+            )
+        )
+    }
+
+    private inline fun <T> safe(block: () -> T): T? = try {
+        block()
+    } catch (_: Throwable) {
+        null
+    }
+
+    private val write = IBleWriteResponse { }
+
+    // ------------------------------------------------------------------
+    // Steps
+    // ------------------------------------------------------------------
+
+    private fun readBattery(done: (String?) -> Unit) {
+        manager.readBattery(write) { data ->
+            val percent = if (data.isPercent) data.batteryPercent else data.batteryLevel * 25
+            batteryPercent = percent
+            bag.put(BATTERY, mutableMapOf("value" to percent, "time" to HealthRecords.now()))
+            done(null)
+        }
+    }
+
+    private fun readCurrentSteps(done: (String?) -> Unit) {
+        manager.readSportStep(write) { data ->
+            val time = HealthRecords.now()
+            if (data.step > 0) {
+                bag.put(STEP_COUNT, mutableMapOf<String, Any?>(
+                    "value" to data.step, "distance" to data.dis, "source" to ONLINE, "time" to time,
+                ).withBattery())
+            }
+            if (data.kcal > 0) {
+                bag.put(CALORIE, mutableMapOf<String, Any?>(
+                    "value" to data.kcal, "source" to ONLINE, "time" to time,
+                ).withBattery())
+            }
+            done(null)
+        }
+    }
+
+    private fun MutableMap<String, Any?>.withBattery(): MutableMap<String, Any?> {
+        batteryPercent?.let { this["battery_level"] = it }
+        return this
+    }
+
+    // ---- 5-minute daily data: HR, BP, steps, kcal, temp, SpO2, HRV, glucose ----
+
+    private val dailySteps = HashMap<String, Int>()
+    private val dailyKcal = HashMap<String, Double>()
+    private val dailyDistance = HashMap<String, Double>()
+
+    private fun readDaily(done: (String?) -> Unit) {
+        val setting = ReadOriginSetting(0, 1, false, readDays)
+        val protocol = safe { sp.originProtocolVersion } ?: 0
+        if (protocol == 3 || protocol == 5) {
+            manager.readOriginDataBySetting(write, object : IOriginData3Listener {
+                override fun onOriginFiveMinuteListDataChange(list: MutableList<OriginData3>?) {
+                    list?.sortedBy { HealthRecords.time(it.date, it.getmTime()) }?.forEach { onOrigin3(it) }
+                }
+
+                override fun onOriginHalfHourDataChange(data: OriginHalfHourData?) {}
+
+                override fun onOriginHRVOriginListDataChange(list: MutableList<HRVOriginData>?) {
+                    list?.forEach { onHrv(it) }
+                }
+
+                override fun onOriginSpo2OriginListDataChange(list: MutableList<Spo2hOriginData>?) {
+                    list?.forEach { onSpo2(it) }
+                }
+
+                override fun onReadOriginProgressDetail(day: Int, date: String?, all: Int, current: Int) {}
+                override fun onReadOriginProgress(p: Float) = progress("daily", p)
+                override fun onReadOriginComplete() = done(null)
+                override fun onReadTimeout(code: Int) = done("watch timeout ($code)")
+            }, setting)
+        } else {
+            manager.readOriginDataBySetting(write, object : IOriginDataListener {
+                override fun onOringinFiveMinuteDataChange(data: OriginData?) {
+                    data?.let { onOrigin(it) }
+                }
+
+                override fun onOringinHalfHourDataChange(data: OriginHalfHourData?) {}
+                override fun onReadOriginProgressDetail(day: Int, date: String?, all: Int, current: Int) {}
+                override fun onReadOriginProgress(p: Float) = progress("daily", p)
+                override fun onReadOriginComplete() = done(null)
+                override fun onReadTimeout(code: Int) = done("watch timeout ($code)")
+            }, setting)
+        }
+    }
+
+    /** Shared part of OriginData / OriginData3. Steps & kcal become daily running totals. */
+    private fun onOriginCommon(data: OriginData, time: String, heart: Int?) {
+        val date = time.substring(0, 10)
+        if (heart != null && heart in 30..250) {
+            bag.put(HEART_RATE, mutableMapOf("value" to heart, "source" to OFFLINE, "time" to time))
+        }
+        if (data.highValue > 0 && data.lowValue > 0) {
+            bag.put(BLOOD_PRESSURE, mutableMapOf(
+                "sbp" to data.highValue, "dbp" to data.lowValue, "source" to OFFLINE, "time" to time,
+            ))
+        }
+        if (data.stepValue > 0 || data.calValue > 0) {
+            val steps = (dailySteps[date] ?: 0) + data.stepValue
+            val kcal = (dailyKcal[date] ?: 0.0) + data.calValue
+            val dist = (dailyDistance[date] ?: 0.0) + data.disValue
+            dailySteps[date] = steps
+            dailyKcal[date] = kcal
+            dailyDistance[date] = dist
+            if (steps > 0) {
+                bag.putIfAbsent(STEP_COUNT, mutableMapOf(
+                    "value" to steps, "distance" to round2(dist), "source" to OFFLINE, "time" to time,
+                ))
+            }
+            if (kcal > 0) {
+                bag.putIfAbsent(CALORIE, mutableMapOf("value" to round2(kcal), "source" to OFFLINE, "time" to time))
+            }
+        }
+        if (data.temperature > 0) {
+            bag.putIfAbsent(BODY_TEMP, mutableMapOf<String, Any?>(
+                "value" to round2(data.temperature), "source" to OFFLINE, "time" to time,
+            ).apply { if (data.baseTemperature > 0) this["base_temp"] = round2(data.baseTemperature) })
+        }
+    }
+
+    private fun onOrigin(data: OriginData) {
+        val time = HealthRecords.time(data.date, data.getmTime()) ?: return
+        onOriginCommon(data, time, data.rateValue)
+    }
+
+    private fun onOrigin3(data: OriginData3) {
+        val time = HealthRecords.time(data.date, data.getmTime()) ?: return
+        // OriginData3 keeps heart rate in arrays (getPpgs, fallback getEcgs).
+        val heart = HealthRecords.averageNonZero(data.ppgs)
+            ?: HealthRecords.averageNonZero(data.ecgs)
+            ?: data.rateValue.takeIf { it > 0 }
+        onOriginCommon(data, time, heart)
+        HealthRecords.averageNonZero(data.resRates)?.let {
+            bag.putIfAbsent(RESPIRATORY, mutableMapOf("value" to it, "time" to time))
+        }
+        val glucose = safe { data.bloodGlucose } ?: 0f
+        if (glucose > 0f) {
+            val record = mutableMapOf<String, Any?>("value" to round2(glucose.toDouble()), "source" to OFFLINE, "time" to time)
+            safe { data.bloodGlucoseRiskLevel }?.takeIf { it != EBloodGlucoseRiskLevel.NONE }?.let {
+                record["risk_level"] = it.name.lowercase()
+            }
+            bag.putIfAbsent(BLOOD_GLUCOSE, record)
+        }
+        val stress = safe { data.pressure } ?: 0
+        if (stress in 1..100) {
+            bag.putIfAbsent(STRESS, mutableMapOf(
+                "value" to stress, "status" to HealthRecords.stressStatus(stress), "time" to time,
+            ))
+        }
+    }
+
+    private fun onSpo2(data: Spo2hOriginData) {
+        val time = HealthRecords.time(data.date, data.getmTime()) ?: return
+        if (data.oxygenValue in 50..100) {
+            bag.put(SPO2, mutableMapOf(
+                "value" to data.oxygenValue,
+                "source" to OFFLINE,
+                "apnea_result" to data.apneaResult,
+                "is_hypoxia" to data.isHypoxia,
+                "hypoxia_time" to data.hypoxiaTime,
+                "hypopnea" to data.hypopnea,
+                "cardiac_load" to data.cardiacLoad,
+                "hr_variation" to data.gethRVariation(),
+                "time" to time,
+            ))
+        }
+        if (data.respirationRate > 0) {
+            bag.put(RESPIRATORY, mutableMapOf("value" to data.respirationRate, "time" to time))
+        }
+    }
+
+    private fun onHrv(data: HRVOriginData) {
+        val time = HealthRecords.time(data.date, data.getmTime()) ?: return
+        if (data.hrvValue <= 0) return
+        val bpm = data.rate?.split(',', ' ', ';')?.mapNotNull { it.trim().toIntOrNull() }?.filter { it > 0 }
+            ?.takeIf { it.isNotEmpty() }?.average()?.toInt() ?: 0
+        bag.put(HRV, mutableMapOf("value" to data.hrvValue, "bpm" to bpm, "hrv_type" to data.hrvType, "time" to time))
+    }
+
+    // ---- sleep ----
+
+    private fun readSleep(done: (String?) -> Unit) {
+        manager.readSleepData(write, object : ISleepDataListener {
+            override fun onSleepDataChange(day: String?, data: SleepData?) {
+                data?.let { onSleep(it) }
+            }
+
+            override fun onSleepProgress(p: Float) = progress("sleep", p)
+            override fun onSleepProgressDetail(day: String?, packageNumber: Int) {}
+            override fun onReadSleepComplete() = done(null)
+        }, readDays)
+    }
+
+    /**
+     * REM / awake minutes of a precise sleep curve. Newer firmware writes a hex
+     * string, 4 chars (16 bits) per minute, state = value >> 13: 0 deep, 1 light,
+     * 2 REM, 3 insomnia, 4 awake. Older ones write 1 char per minute (2 = REM, 4 = awake).
+     */
+    private fun preciseRemAwake(line: String, minutes: Int): Pair<Int, Int> {
+        if (minutes > 0 && line.length >= minutes * 2) {
+            val step = line.length / minutes
+            val states = (0..line.length - step step step).map { (line[it].digitToIntOrNull(16) ?: 0) shr 1 }
+            return states.count { it == 2 } to states.count { it == 4 }
+        }
+        return line.count { it == '2' } to line.count { it == '4' }
+    }
+
+    private fun onSleep(data: SleepData) {
+        val start = HealthRecords.millis(data.sleepDown) ?: return
+        val end = HealthRecords.millis(data.sleepUp) ?: return
+        if (end <= start || data.allSleepTime <= 0) return
+        val line = data.sleepLine ?: ""
+        val record = mutableMapOf<String, Any?>(
+            "allSleep" to data.allSleepTime,
+            "deepSleep" to data.deepSleepTime,
+            "lightSleep" to data.lowSleepTime,
+            "startTime" to start,
+            "endTime" to end,
+            "sleep_date" to data.date,
+            "sleep_quality" to data.sleepQulity,
+            "wake_count" to data.wakeCount,
+            "sleep_line" to line,
+        )
+        if (data is SleepPrecisionData) {
+            val (rem, awake) = preciseRemAwake(line, ((end - start) / 60_000).toInt())
+            record["rem"] = rem
+            record["awakeShort"] = awake
+            record["fall_asleep_score"] = data.fallAsleepScore
+            record["deep_score"] = data.deepScore
+            record["sleep_efficiency_score"] = data.sleepEfficiencyScore
+            record["sleep_time_score"] = data.sleepTimeScore
+            record["getup_score"] = data.getUpScore
+            record["insomnia_score"] = data.insomniaScore
+            record["insomnia_times"] = data.insomniaTimes
+            record["insomnia_length"] = data.insomniaLength
+        } else {
+            // Normal curve: 1 char = 5 minutes; 2 = awake.
+            record["rem"] = 0
+            record["awakeShort"] = line.count { it == '2' } * 5
+        }
+        bag.put(SLEEP, record, key = start.toString())
+    }
+
+    // ---- temperature (devices whose temperatureType != 5) ----
+
+    private fun readTemperature(done: (String?) -> Unit) {
+        manager.readTemptureDataBySetting(write, object : ITemptureDataListener {
+            override fun onTemptureDataListDataChange(list: MutableList<TemptureData>?) {
+                list?.forEach { t ->
+                    val time = HealthRecords.time(null, t.getmTime()) ?: return@forEach
+                    if (t.tempture > 0) {
+                        bag.put(BODY_TEMP, mutableMapOf<String, Any?>(
+                            "value" to round2(t.tempture.toDouble()),
+                            "source" to if (t.isFromHandler) ONLINE else OFFLINE,
+                            "time" to time,
+                        ).apply { if (t.baseTempture > 0) this["base_temp"] = round2(t.baseTempture.toDouble()) })
+                    }
+                }
+            }
+
+            override fun onReadOriginProgressDetail(day: Int, date: String?, all: Int, current: Int) {}
+            override fun onReadOriginProgress(p: Float) = progress("temperature", p)
+            override fun onReadOriginComplete() = done(null)
+            override fun onReadTimeout(code: Int) = done("watch timeout ($code)")
+        }, ReadOriginSetting(0, 1, false, readDays))
+    }
+
+    // ---- RR interval, one day after another ----
+
+    private fun readRrInterval(done: (String?) -> Unit) {
+        val dayStates = listOf(DayState.TODAY, DayState.YESTERDAY, DayState.BEFORE_YESTERDAY).take(readDays)
+        fun read(index: Int) {
+            if (index >= dayStates.size) return done(null)
+            manager.readRRIntervalByDay(write, object : IRRIntervalProgressListener {
+                override fun onReadRRIntervalProgressChanged(p: Float, data: RRIntervalData?) {
+                    progress("rrinterval", (index + p) / dayStates.size)
+                }
+
+                override fun onReadRRIntervalComplete(state: DayState?, list: MutableList<RRIntervalData>?) {
+                    list?.forEach { rr ->
+                        val time = HealthRecords.time(null, rr.date) ?: return@forEach
+                        val values = HealthRecords.clip(rr.data?.filter { it > 0 }?.toIntArray()) ?: return@forEach
+                        bag.put(RR_INTERVAL, mutableMapOf("rr_arry" to values, "time" to time))
+                    }
+                    main.postDelayed({ read(index + 1) }, 100)
+                }
+            }, dayStates[index], 0)
+        }
+        read(0)
+    }
+
+    // ---- sport sessions ----
+
+    private fun readSport(done: (String?) -> Unit) {
+        manager.readSportModelOrigin(write, object : ISportModelOriginListener {
+            override fun onReadOriginProgress(p: Float) = progress("sport", p)
+            override fun onReadOriginProgressDetail(day: Int, date: String?, all: Int, current: Int) {}
+
+            override fun onHeadChangeListListener(head: SportModelOriginHeadData?) {
+                head ?: return
+                addSport(
+                    head.startTime, head.stopTime, head.sportType, head.sportTime, head.stepCount,
+                    head.distance, head.kcals, head.averRate, head.pauseCount, head.pauseTime, head.peisu, head.sportCount,
+                )
+            }
+
+            override fun onGPSWatchSportModeHeadChange(head: SportModelGPSWatchOriginHeadData?) {
+                head ?: return
+                // GPS heads report distance in m and calories in cal.
+                addSport(
+                    head.startTime, head.stopTime, head.sportType, head.sportTime, head.stepCount,
+                    head.distance / 1000.0, head.calories / 1000.0, head.averRate, head.pauseCount, head.pauseTime,
+                    null, head.sportCount,
+                )
+            }
+
+            override fun onItemChangeListListener(items: MutableList<SportModelOriginItemData>?) {}
+            override fun onReadOriginComplete() = done(null)
+        })
+    }
+
+    private fun addSport(
+        start: TimeData?, stop: TimeData?, type: Int, seconds: Int, steps: Int, distanceKm: Double,
+        kcal: Double, avgHr: Int, pauseCount: Int, pauseTime: Int, pace: Int?, sportCount: Int,
+    ) {
+        val time = HealthRecords.time(null, start) ?: return
+        if (steps <= 0 && distanceKm <= 0 && kcal <= 0 && seconds <= 0) return
+        val record = mutableMapOf<String, Any?>(
+            "time" to time,
+            "sport_type" to type,
+            "duration" to seconds,
+            "steps" to steps,
+            "distance" to round2(distanceKm),
+            "calories" to round2(kcal),
+            "avg_heartrate" to avgHr,
+            "pause_count" to pauseCount,
+            "pause_time" to pauseTime,
+            "sport_count" to sportCount,
+        )
+        HealthRecords.time(null, stop)?.takeIf { it >= time }?.let { record["end_time"] = it }
+        if (pace != null && pace > 0) record["pace"] = pace
+        bag.put(SPORT, record)
+    }
+
+    // ---- ECG measured on the watch (offline store) ----
+
+    private fun readEcg(done: (String?) -> Unit) {
+        manager.readECGData(
+            write, TimeData(0, 0, 0, 0, 0, 0), com.veepoo.protocol.model.enums.EEcgDataType.ALL,
+            object : IECGReadDataListener {
+                override fun readDataFinish(list: MutableList<EcgDetectResult>?) {
+                    list?.forEach { r ->
+                        ecgRecord(r, if (r.type == EECGResultType.DATA_FORM_APP) "manual" else "auto")
+                            ?.let { bag.put(ECG, it) }
+                    }
+                    done(null)
+                }
+
+                override fun readDiagnosisDataFinish(list: MutableList<EcgDiagnosis>?) {
+                    list?.forEach { d -> ecgDiagnosisRecord(d, "auto")?.let { bag.put(ECG, it) } }
+                    done(null)
+                }
+            },
+        )
+    }
+
+    // ---- heart-rate alarm thresholds → warning events from synced HR ----
+
+    private fun readHeartWarning(done: (String?) -> Unit) {
+        manager.readHeartWarning(write, IHeartWaringDataListener { data ->
+            if (data != null && data.isOpen && data.heartHigh > 0) {
+                for (hr in bag.records(HEART_RATE)) {
+                    val value = (hr["value"] as? Number)?.toInt() ?: continue
+                    val type = when {
+                        value > data.heartHigh -> "high"
+                        data.heartLow > 0 && value < data.heartLow -> "low"
+                        else -> null
+                    } ?: continue
+                    bag.put(HEART_WARNING, mutableMapOf(
+                        "value" to value, "warning_type" to type,
+                        "heart_high" to data.heartHigh, "heart_low" to data.heartLow, "time" to hr["time"],
+                    ))
+                }
+            }
+            done(null)
+        })
+    }
+
+    companion object {
+        private const val TAG = "HBandSync"
+
+        fun round2(v: Double): Double = Math.round(v * 100.0) / 100.0
+
+        /** Shared with live ECG measurement. */
+        fun ecgRecord(r: EcgDetectResult, mode: String): MutableMap<String, Any?>? {
+            val time = HealthRecords.time(null, r.timeBean) ?: HealthRecords.now()
+            val wave = HealthRecords.clip(r.filterSignals) ?: HealthRecords.clip(r.originSign)
+            if (r.aveHeart <= 0 && wave == null) return null
+            return mutableMapOf<String, Any?>(
+                "mode" to mode,
+                "heart_rate" to r.aveHeart,
+                "resp_rate" to r.aveResRate,
+                "hrv" to r.aveHrv,
+                "qt" to r.aveQT,
+                "duration" to r.duration,
+                "frequency" to r.frequency,
+                "lead_sign" to r.leadSign,
+                "time" to time,
+            ).apply {
+                r.result8?.let { this["result8"] = it.toList() }
+                r.diseaseResult?.let { this["disease_result"] = it.toList() }
+                wave?.let { this["wave"] = it }
+            }
+        }
+
+        fun ecgDiagnosisRecord(d: EcgDiagnosis, mode: String): MutableMap<String, Any?>? {
+            val time = HealthRecords.time(null, d.timeBean) ?: HealthRecords.now()
+            val wave = HealthRecords.clip(d.filterSignals)
+            if (d.heartRate <= 0 && wave == null) return null
+            return mutableMapOf<String, Any?>(
+                "mode" to mode,
+                "heart_rate" to d.heartRate,
+                "resp_rate" to d.respRate,
+                "hrv" to d.hrv,
+                "qt" to d.qtTime,
+                "duration" to d.duration,
+                "frequency" to d.frequency,
+                "disease_risk" to d.diseaseRisk,
+                "pressure_index" to d.pressureIndex,
+                "fatigue_index" to d.fatigueIndex,
+                "myocarditis_risk" to d.myocarditisRisk,
+                "chd_risk" to d.chdRisk,
+                "angiosclerotic_risk" to d.angioscleroticRisk,
+                "qrs_time" to d.qrsTime,
+                "qrs_amp" to d.qrsAmp,
+                "pwv" to d.pwvMeanVal,
+                "st_amp" to d.stMeanAmp,
+                "sdnn" to d.diseaseSdnn,
+                "rmssd" to d.diseaseRmssd,
+                "time" to time,
+            ).apply {
+                d.diagnosis8?.let { this["result8"] = it.toList() }
+                d.diseaseResult?.let { this["disease_result"] = it.toList() }
+                wave?.let { this["wave"] = it }
+            }
+        }
+    }
+}
