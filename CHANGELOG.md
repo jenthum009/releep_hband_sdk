@@ -1,3 +1,13 @@
+## 0.0.3
+
+* Body temperature measurement (Android + iOS): when the watch is busy, stops the pending test
+  before retrying, up to 5 times 3 s apart. iOS no longer treats `enable == false` as busy while
+  the watch reports progress or a value, and finishes with the last value when the watch closes
+  the test.
+* iOS connect: a connect to the watch already paired that stalls after JieLi auth is dropped and
+  retried automatically (15 s per attempt, 2 retries); a stalled silent auto-reconnect is retried
+  by the watchdog instead of blocking it until the app is relaunched.
+
 ## 0.0.2
 
 * Sleep: precise sleep segments linked by `lastType` / `nextType` (iOS) or `laster` / `next`
@@ -6,13 +16,8 @@
   `awakeShort` = `getUpDuration`, `rem` = REM minutes of the curve.
 * Sleep: `sleep_line` is one digit per minute on both platforms; corrupt segments (longer than
   24 h or in the future) are skipped.
-* Body temperature measurement (Android + iOS): when the watch is busy, stops the pending test and
-  retries up to 5 times (3 s apart); keeps `base_temp` from earlier callbacks. iOS no longer treats
-  `enable == false` as busy while the watch reports progress or a value, and finishes with the last
-  value when the watch closes the test.
-* iOS connect: a connect to the watch already paired that stalls after JieLi auth is dropped and
-  retried automatically (15 s per attempt, 2 retries); a stalled silent auto-reconnect is retried
-  by the watchdog instead of blocking it until relaunch.
+* Body temperature measurement (Android + iOS): retries up to 3 times when the watch is busy and
+  keeps `base_temp` from earlier callbacks.
 * History sync: a step is given up after 30 s without progress instead of its full timeout.
 * RR interval only reads blocks not read before. New `HBandSdk.confirmHealthUpload()`: call it
   after the sync's records reached the backend; until then the same blocks are read again.
