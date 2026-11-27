@@ -48,8 +48,8 @@ final class HealthMeasure {
     // Temperature watches can briefly report "busy" while an automatic health
     // reading is finishing. They can also report the raw/skin value in an
     // earlier callback and omit it from the final (100%) callback.
-    private static let temperatureMaxBusyRetries = 3
-    private static let temperatureBusyRetryDelay: TimeInterval = 1.5
+    private static let temperatureMaxBusyRetries = 5
+    private static let temperatureBusyRetryDelay: TimeInterval = 3
     private var temperatureBusyRetries = 0
     private var temperatureRetryItem: DispatchWorkItem?
     private var temperatureAttempt = 0
@@ -631,6 +631,9 @@ final class HealthMeasure {
             return fail("Watch is busy")
         }
         temperatureBusyRetries += 1
+        // Stop our own pending test first: a start sent while one is still
+        // open is answered "busy" again.
+        peripheral.veepooSDK_temperatureTestStart(false) { _, _, _, _, _ in }
         update(nil, nil)
         let item = DispatchWorkItem { [weak self] in self?.startTemperature() }
         temperatureRetryItem = item
