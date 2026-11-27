@@ -148,6 +148,14 @@ final class HealthSync {
     private var ended = false
     private var stepTimeout: DispatchWorkItem?
     private var stepIndex = 0
+
+    /// A step whose watch stops answering is given up after this long without
+    /// any progress, instead of waiting for its full timeout (up to minutes).
+    private static let idleLimit: TimeInterval = 30
+    private var idleTimeout: DispatchWorkItem?
+    private var idleLimitForStep: TimeInterval = 0
+    private var onIdle: (() -> Void)?
+    private var currentStage: String?
     private let started = Date()
 
     private struct Step {
@@ -156,6 +164,9 @@ final class HealthSync {
         let wanted: Set<String>
         let supported: () -> Bool
         let run: (@escaping (String?) -> Void) -> Void
+        /// False when the SDK gives no progress while the step runs: then only
+        /// the full timeout applies, not [idleLimit].
+        var reportsProgress: Bool = true
     }
 
     private var steps: [Step] = []
@@ -180,7 +191,7 @@ final class HealthSync {
                  run: readTemperature),
             Step(name: "database", timeout: 30, wanted: Set(H.allTypes), supported: { true }, run: queryDatabase),
             Step(name: "rrinterval", timeout: 180, wanted: [H.rrInterval], supported: { true }, run: readRrInterval),
-            Step(name: "sport", timeout: 120, wanted: [H.sport], supported: { true }, run: readSport),
+            Step(name: "sport", timeout: 120, wanted: [H.sport], supported: { true }, run: readSport, reportsProgress: false),
             Step(name: "heartwarning", timeout: 10, wanted: [H.heartWarning], supported: { true }, run: readHeartWarning),
         ]
     }
@@ -211,6 +222,7 @@ final class HealthSync {
         DispatchQueue.main.async {
             guard !self.ended else { return }
             self.stepTimeout?.cancel()
+            self.clearIdle()
             self.errors["link"] = reason
             self.finish(cancelledByUser: false)
         }
@@ -229,21 +241,34 @@ final class HealthSync {
             skipped.append(step.name)
             return next()
         }
-        progress(step.name, nil)
         var answered = false
         let timeout = DispatchWorkItem { [weak self] in
             guard let self = self, !answered else { return }
             answered = true
+            self.clearIdle()
             self.errors[step.name] = "timeout"
             self.next()
         }
         stepTimeout = timeout
         DispatchQueue.main.asyncAfter(deadline: .now() + step.timeout, execute: timeout)
+        currentStage = step.name
+        idleLimitForStep = step.reportsProgress ? min(HealthSync.idleLimit, step.timeout) : step.timeout
+        onIdle = { [weak self] in
+            guard let self = self, !answered else { return }
+            answered = true
+            timeout.cancel()
+            self.clearIdle()
+            self.errors[step.name] = "timeout (no response for \(Int(self.idleLimitForStep)) s)"
+            self.next()
+        }
+        progress(step.name, nil)
+        armIdle()
         step.run { [weak self] error in
             DispatchQueue.main.async {
                 guard let self = self, !answered else { return }
                 answered = true
                 timeout.cancel()
+                self.clearIdle()
                 if let error = error { self.errors[step.name] = error }
                 // Short gap: the SDK needs a moment between commands.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.next() }
@@ -251,7 +276,28 @@ final class HealthSync {
         }
     }
 
+    /// (Re)starts the no-progress timer of the running step. Main thread only.
+    private func armIdle() {
+        idleTimeout?.cancel()
+        guard let fire = onIdle else { return }
+        let item = DispatchWorkItem { fire() }
+        idleTimeout = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + idleLimitForStep, execute: item)
+    }
+
+    private func clearIdle() {
+        idleTimeout?.cancel()
+        idleTimeout = nil
+        onIdle = nil
+        currentStage = nil
+    }
+
     private func progress(_ stage: String, _ fraction: Double?) {
+        // Any sign of life from the running step restarts its idle timer.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, !self.ended, stage == self.currentStage else { return }
+            self.armIdle()
+        }
         let index = Double(steps.firstIndex { $0.name == stage } ?? 0)
         let overall = (index + min(max(fraction ?? 0, 0), 1)) / Double(steps.count)
         var event: [String: Any] = ["kind": "sync", "stage": stage, "progress": overall]
@@ -262,6 +308,9 @@ final class HealthSync {
     private func finish(cancelledByUser: Bool) {
         guard !ended else { return }
         ended = true
+        clearIdle()
+        // The RR records read in this run are returned below.
+        saveRrBookmarks()
         let records = bag.toMap().filter { types.contains($0.key) }
         onDone([
             "success": errors.isEmpty && !cancelledByUser,
@@ -599,31 +648,66 @@ final class HealthSync {
 
     // MARK: RR interval (two bytes per value, little endian, ms)
 
+    // RR interval: the watch makes one block per minute (1440 a day) and the
+    // read can start at any block. Remember the last block read per watch and
+    // day so each sync only transfers the new blocks.
+    private static let rrBookmarkKey = "releep_hband_sync.rrBookmarks"
+    private static let rrBlocksPerDay = 1440
+    /// Bookmarks reached in this run, saved when the sync ends.
+    private var rrPending: [String: Int] = [:]
+
+    private func rrKey(_ date: String) -> String { "\(tableId)|\(date)" }
+
     private func readRrInterval(_ done: @escaping (String?) -> Void) {
         guard let peripheral = peripheral else { return done("not ready") }
-        let total = readDays
+        let dates = queryDates
+        let saved = UserDefaults.standard.dictionary(forKey: HealthSync.rrBookmarkKey) as? [String: Int] ?? [:]
         func read(_ day: Int) {
-            guard day < total else { return done(nil) }
+            guard day < dates.count else { return done(nil) }
+            let key = rrKey(dates[day])
+            let last = saved[key] ?? 0
+            // A past day that was read to its end cannot get new blocks.
+            if last >= HealthSync.rrBlocksPerDay { return read(day + 1) }
+            var maxBlock = last
             var dayDone = false
-            peripheral.veepooSDK_readRRIntervalData(withDayNumber: day, blockNumber: 1) { [weak self] object, progress, error in
+            peripheral.veepooSDK_readRRIntervalData(withDayNumber: day, blockNumber: last + 1) { [weak self] object, progress, error in
                 DispatchQueue.main.async {
                     guard let self = self, !dayDone else { return }
                     if error != nil {
+                        // Also reported when there is no new block yet: keep the bookmark.
                         dayDone = true
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { read(day + 1) }
                         return
                     }
-                    if let rr = object as? VPRRIntervalDataModel { self.addRr(rr) }
+                    if let rr = object as? VPRRIntervalDataModel {
+                        self.addRr(rr)
+                        maxBlock = max(maxBlock, rr.blockNumber)
+                    }
                     let fraction = progress?.fractionCompleted ?? 0
-                    self.progress("rrinterval", (Double(day) + fraction) / Double(total))
+                    self.progress("rrinterval", (Double(day) + fraction) / Double(dates.count))
                     if fraction >= 1 {
                         dayDone = true
+                        self.rrPending[key] = day > 0 ? HealthSync.rrBlocksPerDay : maxBlock
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { read(day + 1) }
                     }
                 }
             }
         }
         read(0)
+    }
+
+    /// Stores this run's RR bookmarks and drops the ones older than the watch keeps.
+    private func saveRrBookmarks() {
+        guard !rrPending.isEmpty else { return }
+        var saved = UserDefaults.standard.dictionary(forKey: HealthSync.rrBookmarkKey) as? [String: Int] ?? [:]
+        saved.merge(rrPending) { $1 }
+        let oldest = Calendar.current.date(byAdding: .day, value: -4, to: Date()) ?? Date()
+        saved = saved.filter { key, _ in
+            guard let date = key.split(separator: "|").last.flatMap({ HealthRecords.dateFormat.date(from: String($0)) }) else { return false }
+            return date >= oldest
+        }
+        UserDefaults.standard.set(saved, forKey: HealthSync.rrBookmarkKey)
+        rrPending.removeAll()
     }
 
     private func addRr(_ rr: VPRRIntervalDataModel) {

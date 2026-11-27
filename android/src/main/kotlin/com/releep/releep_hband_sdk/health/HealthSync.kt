@@ -90,7 +90,18 @@ class HealthSync(
         val wanted: Set<String>,
         val supported: () -> Boolean,
         val run: (done: (String?) -> Unit) -> Unit,
+        /** False when the SDK gives no progress while the step runs: only the full timeout applies. */
+        val reportsProgress: Boolean = true,
     )
+
+    /**
+     * A step whose watch stops answering is given up after this long without
+     * any progress, instead of waiting for its full timeout (up to minutes).
+     */
+    private val idleLimitMs = 30_000L
+    private var idleTimeout: Runnable? = null
+    private var idleLimitForStep = 0L
+    private var currentStage: String? = null
 
     private val watchDays: Int
         get() = WatchSession.watchDays(context).coerceAtLeast(1)
@@ -113,7 +124,7 @@ class HealthSync(
         ),
         Step("rrinterval", 120_000, setOf(RR_INTERVAL), { true }, ::readRrInterval),
         Step("sport", 90_000, setOf(SPORT), { sp.isSupportSportModel }, ::readSport),
-        Step("ecg", 90_000, setOf(ECG), { sp.isSupportECG }, ::readEcg),
+        Step("ecg", 90_000, setOf(ECG), { sp.isSupportECG }, ::readEcg, reportsProgress = false),
         Step("heartwarning", 10_000, setOf(HEART_WARNING), { true }, ::readHeartWarning),
     )
 
@@ -130,6 +141,7 @@ class HealthSync(
     fun abort(reason: String) = main.post {
         if (ended) return@post
         stepTimeout?.let { main.removeCallbacks(it) }
+        clearIdle()
         errors["link"] = reason
         finish(cancelledByUser = false)
     }
@@ -146,23 +158,37 @@ class HealthSync(
             skipped += step.name
             return next()
         }
-        progress(step.name, null)
         var answered = false
         val timeout = Runnable {
             if (!answered) {
                 answered = true
+                clearIdle()
                 errors[step.name] = "timeout"
                 next()
             }
         }
         stepTimeout = timeout
         main.postDelayed(timeout, step.timeoutMs)
+        currentStage = step.name
+        idleLimitForStep = if (step.reportsProgress) minOf(idleLimitMs, step.timeoutMs) else step.timeoutMs
+        idleTimeout = Runnable {
+            if (!answered) {
+                answered = true
+                main.removeCallbacks(timeout)
+                clearIdle()
+                errors[step.name] = "timeout (no response for ${idleLimitForStep / 1000} s)"
+                next()
+            }
+        }
+        progress(step.name, null)
+        armIdle()
         try {
             step.run { error ->
                 main.post {
                     if (answered) return@post
                     answered = true
                     main.removeCallbacks(timeout)
+                    clearIdle()
                     if (error != null) errors[step.name] = error
                     // Short gap: the SDK needs a moment between commands.
                     main.postDelayed({ next() }, 150)
@@ -173,13 +199,29 @@ class HealthSync(
             if (!answered) {
                 answered = true
                 main.removeCallbacks(timeout)
+                clearIdle()
                 errors[step.name] = e.message ?: e.javaClass.simpleName
                 next()
             }
         }
     }
 
+    /** (Re)starts the no-progress timer of the running step. Main thread only. */
+    private fun armIdle() {
+        val idle = idleTimeout ?: return
+        main.removeCallbacks(idle)
+        main.postDelayed(idle, idleLimitForStep)
+    }
+
+    private fun clearIdle() {
+        idleTimeout?.let { main.removeCallbacks(it) }
+        idleTimeout = null
+        currentStage = null
+    }
+
     private fun progress(stage: String, fraction: Float?) {
+        // Any sign of life from the running step restarts its idle timer.
+        main.post { if (!ended && stage == currentStage) armIdle() }
         val stageIndex = steps.indexOfFirst { it.name == stage }.coerceAtLeast(0)
         val overall = (stageIndex + (fraction ?: 0f).coerceIn(0f, 1f)) / steps.size
         main.post {
@@ -197,6 +239,8 @@ class HealthSync(
     private fun finish(cancelledByUser: Boolean) {
         if (ended) return
         ended = true
+        clearIdle()
+        saveRrBookmarks()
         val records = bag.toMap().filterKeys { it in types }
         onDone(
             mapOf(
@@ -482,26 +526,58 @@ class HealthSync(
 
     // ---- RR interval, one day after another ----
 
+    // RR interval: the watch makes one block per minute (1440 a day) and the
+    // read can start at any block. Remember the last block read per watch and
+    // day so each sync only transfers the new blocks.
+    private val rrPrefs by lazy { context.getSharedPreferences("releep_hband_sync", Context.MODE_PRIVATE) }
+    /** Bookmarks reached in this run, saved when the sync ends. */
+    private val rrPending = HashMap<String, Int>()
+
+    private fun rrDate(daysAgo: Int): String {
+        val cal = java.util.Calendar.getInstance().apply { add(java.util.Calendar.DAY_OF_YEAR, -daysAgo) }
+        return java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(cal.time)
+    }
+
+    private fun rrKey(date: String) = "rr|${WatchSession.mac(context)}|$date"
+
     private fun readRrInterval(done: (String?) -> Unit) {
         val dayStates = listOf(DayState.TODAY, DayState.YESTERDAY, DayState.BEFORE_YESTERDAY).take(readDays)
         fun read(index: Int) {
             if (index >= dayStates.size) return done(null)
+            val key = rrKey(rrDate(index))
+            val last = rrPrefs.getInt(key, 0)
+            // A past day that was read to its end cannot get new blocks.
+            if (last >= RR_BLOCKS_PER_DAY) return read(index + 1)
             manager.readRRIntervalByDay(write, object : IRRIntervalProgressListener {
                 override fun onReadRRIntervalProgressChanged(p: Float, data: RRIntervalData?) {
                     progress("rrinterval", (index + p) / dayStates.size)
                 }
 
                 override fun onReadRRIntervalComplete(state: DayState?, list: MutableList<RRIntervalData>?) {
+                    var maxBlock = last
                     list?.forEach { rr ->
+                        maxBlock = maxOf(maxBlock, rr.blockNumber)
                         val time = HealthRecords.time(null, rr.date) ?: return@forEach
                         val values = HealthRecords.clip(rr.data?.filter { it > 0 }?.toIntArray()) ?: return@forEach
                         bag.put(RR_INTERVAL, mutableMapOf("rr_arry" to values, "time" to time))
                     }
+                    rrPending[key] = if (index > 0) RR_BLOCKS_PER_DAY else maxBlock
                     main.postDelayed({ read(index + 1) }, 100)
                 }
-            }, dayStates[index], 0)
+            }, dayStates[index], if (last > 0) last + 1 else 0)
         }
         read(0)
+    }
+
+    /** Stores this run's RR bookmarks and drops the ones older than the watch keeps. */
+    private fun saveRrBookmarks() {
+        if (rrPending.isEmpty()) return
+        val keep = (0..3).map { rrDate(it) }.toSet()
+        val editor = rrPrefs.edit()
+        rrPrefs.all.keys.filter { it.startsWith("rr|") && it.substringAfterLast('|') !in keep }.forEach { editor.remove(it) }
+        rrPending.forEach { (k, v) -> editor.putInt(k, v) }
+        editor.apply()
+        rrPending.clear()
     }
 
     // ---- sport sessions ----
@@ -603,6 +679,7 @@ class HealthSync(
 
     companion object {
         private const val TAG = "HBandSync"
+        private const val RR_BLOCKS_PER_DAY = 1440
 
         fun round2(v: Double): Double = Math.round(v * 100.0) / 100.0
 
