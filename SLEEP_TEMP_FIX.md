@@ -5,7 +5,7 @@
 เอกสารนี้มี 2 เรื่อง:
 
 1. ค่าการนอนจาก VIGOR ไม่ตรงกับที่นาฬิกาแสดง
-2. ตัวแก้การวัดอุณหภูมิยังไม่ถึงแอป และยังไม่มีบน iOS
+2. การวัดอุณหภูมิ fail ทันทีเมื่อนาฬิกาไม่ว่าง (แก้แล้วทั้ง Android / iOS ใน PR #1)
 
 ---
 
@@ -67,37 +67,32 @@ SDK นับ `rem` / `awakeShort` เองจาก `sleep_line` (`preciseRemA
 
 ## 2. การวัดอุณหภูมิ (นาฬิกา BT)
 
-### สิ่งที่แก้ไปแล้ว (เฉพาะ Android, เฉพาะตัว local)
+### สิ่งที่แก้แล้ว (PR #1 : `fix/temperature-busy-retry`)
 
-`android/src/main/kotlin/com/releep/releep_hband_sdk/health/HealthMeasure.kt`
+แก้ทั้งสองแพลตฟอร์มให้ทำงานเหมือนกัน:
 
-- นาฬิกาตอบว่าไม่ว่าง (`deviceState` 1..7) → ลองใหม่สูงสุด 3 ครั้ง ครั้งละ 1.5 วินาที แทนการ fail ทันที
+- Android : `android/src/main/kotlin/com/releep/releep_hband_sdk/health/HealthMeasure.kt`
+- iOS : `ios/Classes/HealthMeasure.swift` (`startTemperature()`, `retryTemperatureAfterBusy()`)
+
+พฤติกรรม:
+
+- นาฬิกาตอบว่าไม่ว่าง (Android `deviceState` 1..7, iOS `enable == false`)
+  → ลองใหม่สูงสุด 3 ครั้ง ครั้งละ 1.5 วินาที แทนการ fail ทันที ครบแล้วยังไม่ว่างจึง fail `"Watch is busy"`
 - จำ `base_temp` จาก callback ก่อนหน้า ถ้า callback สุดท้าย (100%) ไม่ส่งมาก็ยังได้ค่า
-- `removeCallbacks(temperatureRetry)` ตอน cleanup
+  และส่ง `base_temp` ไปกับ progress update ด้วย
+- ยกเลิกรอบ retry ที่ค้างอยู่ตอนจบการวัด (iOS ไม่สนใจ callback ที่มาช้าจากรอบก่อน retry)
 
-### ปัญหาที่ยังเหลือ
+### ขั้นต่อไป
 
-1. **แอปยังไม่ได้ใช้ตัวที่แก้** : `imt-releep-new/pubspec.yaml` ใช้ `releep_hband_sdk: ^0.0.1` จาก pub.dev
-   ซึ่งยังไม่มีตัวแก้นี้ (ไฟล์อื่นของสองตัวเหมือนกันหมด)
-2. **iOS ยังไม่ได้แก้** : `ios/Classes/HealthMeasure.swift` (case `HealthRecords.bodyTemp`)
-   - `enable == false` → fail `"Watch is busy"` ทันที
-   - `base_temp` (`originalTempValue`) อ่านเฉพาะใน callback สุดท้าย ถ้าไม่ส่งมาค่าจะหาย
-
-### แนวทางแก้
-
-1. เพิ่ม busy retry (3 ครั้ง × 1.5 วินาที) และการจำ `base_temp` ใน `HealthMeasure.swift` แบบเดียวกับ Android
-2. ทดสอบในแอป : สลับเป็น
+1. ทดสอบในแอป `imt-releep-new` : สลับเป็น
    ```yaml
    releep_hband_sdk:
-     path: ../EPITWORK/releep_HBandSDK_flutter
+     path: ../EPITWORK/releep_hband_sdk_repo
    ```
    แล้ว `flutter clean && flutter pub get` (iOS : `cd ios && pod install`)
-3. ผ่านแล้ว publish เป็น `0.0.2` → แอปเปลี่ยนเป็น `releep_hband_sdk: ^0.0.2`
-   - ก่อน publish : เอา `homepage` / `repository` / `issue_tracker` ใน `pubspec.yaml`
-     และ `LICENSE` จากตัวบน pub.dev กลับมาใส่ (ตัว local ยังเป็น `TODO`)
-   - แก้ `CHANGELOG.md` จาก `Unreleased` เป็น `0.0.2`
+2. merge PR แล้ว publish เป็น `0.0.2` (แก้ `version` ใน `pubspec.yaml` และ `CHANGELOG.md`)
+3. แอปเปลี่ยนเป็น `releep_hband_sdk: ^0.0.2`
 
 ### ต้องตัดสินใจ
 
-- [ ] แก้ iOS ตามแนวทางข้างบนเลยหรือไม่
 - [ ] ทดสอบด้วย `path:` ก่อน หรือ publish `0.0.2` เลย
