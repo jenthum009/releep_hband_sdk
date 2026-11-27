@@ -309,8 +309,11 @@ final class HealthSync {
         guard !ended else { return }
         ended = true
         clearIdle()
-        // The RR records read in this run are returned below.
-        saveRrBookmarks()
+        // RR bookmarks wait for the app to confirm the upload (confirmUpload).
+        if types.contains(HealthRecords.rrInterval) {
+            HealthSync.pendingRr = rrPending
+            rrPending.removeAll()
+        }
         let records = bag.toMap().filter { types.contains($0.key) }
         onDone([
             "success": errors.isEmpty && !cancelledByUser,
@@ -683,8 +686,11 @@ final class HealthSync {
         for (field, value) in ints {
             if let v = HealthRecords.int(value) { record[field] = v }
         }
-        NSLog("HBand sleep night %@ segments=%d cumulative=%d rem(line)=%d otherDuration=%d",
-              last.date, night.count, cumulative ? 1 : 0, rem, total { $0.otherDuration })
+        // TODO(after a real multi-segment night): confirm which of sum / last
+        // matches the watch, then drop the `cumulative` guess.
+        NSLog("HBand sleep night %@ segments=%d cumulative=%d allSleep sum=%d last=%d rem(line)=%d otherDuration=%d",
+              last.date, night.count, cumulative ? 1 : 0, sum { $0.sleepDuration },
+              HealthRecords.int(m.sleepDuration) ?? 0, rem, total { $0.otherDuration })
         if (record["allSleep"] as? Int ?? 0) > 0 {
             bag.put(HealthRecords.sleep, record, key: String(describing: record["startTime"]!))
         }
@@ -767,18 +773,24 @@ final class HealthSync {
         read(0)
     }
 
-    /// Stores this run's RR bookmarks and drops the ones older than the watch keeps.
-    private func saveRrBookmarks() {
-        guard !rrPending.isEmpty else { return }
-        var saved = UserDefaults.standard.dictionary(forKey: HealthSync.rrBookmarkKey) as? [String: Int] ?? [:]
-        saved.merge(rrPending) { $1 }
+    /// RR bookmarks of the last sync, saved by [confirmUpload].
+    private static var pendingRr: [String: Int] = [:]
+
+    /// The app uploaded the last sync's records: remember how far RR interval
+    /// was read so the next sync only reads new blocks; an unconfirmed run is
+    /// read again. Main thread.
+    static func confirmUpload() {
+        let confirmed = pendingRr
+        pendingRr = [:]
+        guard !confirmed.isEmpty else { return }
+        var saved = UserDefaults.standard.dictionary(forKey: rrBookmarkKey) as? [String: Int] ?? [:]
+        saved.merge(confirmed) { max($0, $1) }
         let oldest = Calendar.current.date(byAdding: .day, value: -4, to: Date()) ?? Date()
         saved = saved.filter { key, _ in
             guard let date = key.split(separator: "|").last.flatMap({ HealthRecords.dateFormat.date(from: String($0)) }) else { return false }
             return date >= oldest
         }
-        UserDefaults.standard.set(saved, forKey: HealthSync.rrBookmarkKey)
-        rrPending.removeAll()
+        UserDefaults.standard.set(saved, forKey: rrBookmarkKey)
     }
 
     private func addRr(_ rr: VPRRIntervalDataModel) {

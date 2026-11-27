@@ -8,8 +8,9 @@
   24 h or in the future) are skipped.
 * Body temperature measurement (Android + iOS): retries up to 3 times when the watch is busy and
   keeps `base_temp` from earlier callbacks.
-* History sync: a step is given up after 30 s without progress instead of its full timeout;
-  RR interval only reads blocks not read before.
+* History sync: a step is given up after 30 s without progress instead of its full timeout.
+* RR interval only reads blocks not read before. New `HBandSdk.confirmHealthUpload()`: call it
+  after the sync's records reached the backend; until then the same blocks are read again.
 
 ## 0.0.1
 

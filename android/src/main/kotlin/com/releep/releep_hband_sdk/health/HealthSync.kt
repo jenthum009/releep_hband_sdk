@@ -240,7 +240,10 @@ class HealthSync(
         if (ended) return
         ended = true
         clearIdle()
-        saveRrBookmarks()
+        // A sleep step that timed out still returns the segments read so far.
+        flushSleepNights()
+        // RR bookmarks wait for the app to confirm the upload (confirmUpload).
+        stashRrBookmarks()
         val records = bag.toMap().filterKeys { it in types }
         onDone(
             mapOf(
@@ -566,7 +569,10 @@ class HealthSync(
             "insomnia_times" to d.insomniaTimes,
             "insomnia_length" to d.insomniaLength,
         )
+        // TODO(after a real multi-segment night): confirm which of sum / last
+        // matches the watch, then drop the `cumulative` guess.
         Log.d(TAG, "sleep night ${d.date} segments=${night.size} cumulative=$cumulative " +
+            "allSleep sum=${night.sumOf { it.data.allSleepTime }} last=${d.allSleepTime} " +
             "rem(line)=$rem otherDuration=${total { it.otherDuration }}")
         if (record["allSleep"] as Int > 0) bag.put(SLEEP, record, key = first.start.toString())
     }
@@ -600,14 +606,11 @@ class HealthSync(
     // RR interval: the watch makes one block per minute (1440 a day) and the
     // read can start at any block. Remember the last block read per watch and
     // day so each sync only transfers the new blocks.
-    private val rrPrefs by lazy { context.getSharedPreferences("releep_hband_sync", Context.MODE_PRIVATE) }
+    private val rrPrefs by lazy { rrPrefs(context) }
     /** Bookmarks reached in this run, saved when the sync ends. */
     private val rrPending = HashMap<String, Int>()
 
-    private fun rrDate(daysAgo: Int): String {
-        val cal = java.util.Calendar.getInstance().apply { add(java.util.Calendar.DAY_OF_YEAR, -daysAgo) }
-        return java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(cal.time)
-    }
+    private fun rrDate(daysAgo: Int) = rrDateKey(daysAgo)
 
     private fun rrKey(date: String) = "rr|${WatchSession.mac(context)}|$date"
 
@@ -640,14 +643,13 @@ class HealthSync(
         read(0)
     }
 
-    /** Stores this run's RR bookmarks and drops the ones older than the watch keeps. */
-    private fun saveRrBookmarks() {
-        if (rrPending.isEmpty()) return
-        val keep = (0..3).map { rrDate(it) }.toSet()
-        val editor = rrPrefs.edit()
-        rrPrefs.all.keys.filter { it.startsWith("rr|") && it.substringAfterLast('|') !in keep }.forEach { editor.remove(it) }
-        rrPending.forEach { (k, v) -> editor.putInt(k, v) }
-        editor.apply()
+    /**
+     * Keeps this run's RR bookmarks until the app confirms that the records
+     * reached the backend ([confirmUpload]); an unconfirmed run is read again.
+     */
+    private fun stashRrBookmarks() {
+        if (RR_INTERVAL !in types) return
+        pendingRr = HashMap(rrPending)
         rrPending.clear()
     }
 
@@ -751,6 +753,33 @@ class HealthSync(
     companion object {
         private const val TAG = "HBandSync"
         private const val RR_BLOCKS_PER_DAY = 1440
+
+        /** RR bookmarks of the last sync, saved by [confirmUpload]. */
+        private var pendingRr: Map<String, Int> = emptyMap()
+
+        private fun rrPrefs(context: Context) =
+            context.getSharedPreferences("releep_hband_sync", Context.MODE_PRIVATE)
+
+        private fun rrDateKey(daysAgo: Int): String {
+            val cal = java.util.Calendar.getInstance().apply { add(java.util.Calendar.DAY_OF_YEAR, -daysAgo) }
+            return java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(cal.time)
+        }
+
+        /**
+         * The app uploaded the last sync's records: remember how far RR interval
+         * was read so the next sync only reads new blocks. Main thread.
+         */
+        fun confirmUpload(context: Context) {
+            val confirmed = pendingRr
+            pendingRr = emptyMap()
+            if (confirmed.isEmpty()) return
+            val prefs = rrPrefs(context)
+            val keep = (0..3).map { rrDateKey(it) }.toSet()
+            val editor = prefs.edit()
+            prefs.all.keys.filter { it.startsWith("rr|") && it.substringAfterLast('|') !in keep }.forEach { editor.remove(it) }
+            confirmed.forEach { (k, v) -> editor.putInt(k, maxOf(v, prefs.getInt(k, 0))) }
+            editor.apply()
+        }
 
         fun round2(v: Double): Double = Math.round(v * 100.0) / 100.0
 

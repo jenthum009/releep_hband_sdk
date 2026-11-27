@@ -83,6 +83,8 @@ class HealthMeasure(
     private var temperatureBusyRetries = 0
     private var temperatureRetryScheduled = false
     private var lastTemperatureBase: Double? = null
+    /** Callbacks of an attempt that was already retried are ignored. */
+    private var temperatureAttempt = 0
     private val temperatureRetry = Runnable { startTemperatureMeasurement() }
 
     // ECG accumulation
@@ -242,9 +244,10 @@ class HealthMeasure(
     private fun startTemperatureMeasurement() {
         if (finished) return
         temperatureRetryScheduled = false
+        val attempt = ++temperatureAttempt
         manager.startDetectTempture(write) { data ->
             main.post {
-                if (finished) return@post
+                if (finished || attempt != temperatureAttempt) return@post
                 if (data.temptureBase > 0) {
                     lastTemperatureBase = HealthSync.round2(data.temptureBase.toDouble())
                 }
