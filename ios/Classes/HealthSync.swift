@@ -399,6 +399,8 @@ final class HealthSync {
             }
             progress("database", Double(index + 1) / Double(queryDates.count))
         }
+        // A night's segments can be stored under different dates.
+        flushSleepNights()
         group.notify(queue: .main) { done(nil) }
     }
 
@@ -545,56 +547,51 @@ final class HealthSync {
         }
     }
 
-    /// REM / awake minutes of a precise sleep curve. Newer firmware writes a hex
-    /// string, 4 chars (16 bits) per minute, state = value >> 13: 0 deep, 1 light,
-    /// 2 REM, 3 insomnia, 4 awake. Older ones write 1 char per minute (2 = REM, 4 = awake).
-    static func preciseRemAwake(_ line: String, minutes: Int) -> (Int, Int) {
+    /// Precise sleep curve → one digit per minute (0 deep, 1 light, 2 REM,
+    /// 3 insomnia, 4 awake). Newer firmware writes a hex string, 4 chars
+    /// (16 bits) per minute with state = value >> 13; older ones already write
+    /// 1 char per minute. Both platforms send this same format.
+    static func preciseLine(_ line: String, minutes: Int) -> String {
         let chars = Array(line)
-        if minutes > 0 && chars.count >= minutes * 2 {
-            let step = chars.count / minutes
-            let states = stride(from: 0, through: chars.count - step, by: step).map { (chars[$0].hexDigitValue ?? 0) >> 1 }
-            return (states.filter { $0 == 2 }.count, states.filter { $0 == 4 }.count)
-        }
-        return (chars.filter { $0 == "2" }.count, chars.filter { $0 == "4" }.count)
+        guard minutes > 0, chars.count >= minutes * 2 else { return line }
+        let step = chars.count / minutes
+        return String(stride(from: 0, through: chars.count - step, by: step).map { i -> Character in
+            let state = (chars[i].hexDigitValue ?? 0) >> 1
+            return Character(String(min(state, 4)))
+        })
     }
+
+    /// One precise sleep segment as stored by the watch.
+    private struct SleepSegment {
+        let start: Date
+        let end: Date
+        let date: String
+        let model: VPAccurateSleepModel
+        let line: String // 1 digit per minute
+        var linksPrevious: Bool { HealthRecords.int(model.lastType) == 1 }
+        /// 255 = the watch does not know yet (night still going on).
+        var linksNext: Bool { HealthRecords.int(model.nextType) == 1 }
+    }
+
+    /// Precise segments of every queried date, joined into nights by [flushSleepNights].
+    private var sleepSegments: [SleepSegment] = []
 
     private func querySleep(_ date: String) {
         if (model?.sleepType ?? 0) == 1 {
             for s in VPDataBaseOperation.veepooSDKGetAccurateSleepData(withDate: date, andTableID: tableId) ?? [] {
-                guard let start = HealthRecords.parse(s.sleepTime), let end = HealthRecords.parse(s.wakeTime), end > start else { continue }
-                let line = s.sleepLine
-                let (rem, awake) = HealthSync.preciseRemAwake(line, minutes: Int(end.timeIntervalSince(start) / 60))
-                var record: [String: Any] = [
-                    "allSleep": HealthRecords.int(s.sleepDuration) ?? 0,
-                    "deepSleep": HealthRecords.int(s.deepDuration) ?? 0,
-                    "lightSleep": HealthRecords.int(s.lightDuration) ?? 0,
-                    "rem": rem,
-                    "awakeShort": awake,
-                    "startTime": Int64(start.timeIntervalSince1970 * 1000),
-                    "endTime": Int64(end.timeIntervalSince1970 * 1000),
-                    "sleep_date": date,
-                    "sleep_line": line,
-                ]
-                let ints: [(String, String?)] = [
-                    ("sleep_quality", s.sleepQuality), ("wake_count", s.getUpTimes),
-                    ("fall_asleep_score", s.fallAsleepScore), ("deep_score", s.deepScore),
-                    ("sleep_efficiency_score", s.sleepEfficiencyScore), ("sleep_time_score", s.sleepTimeScore),
-                    ("getup_score", s.getUpScore), ("insomnia_score", s.insomniaScore),
-                    ("insomnia_times", s.insomniaTimes), ("insomnia_length", s.insomniaDuration),
-                ]
-                for (field, value) in ints {
-                    if let v = HealthRecords.int(value) { record[field] = v }
-                }
-                if (record["allSleep"] as? Int ?? 0) > 0 {
-                    bag.put(HealthRecords.sleep, record, key: String(describing: record["startTime"]!))
-                }
+                guard let start = HealthRecords.parse(s.sleepTime), let end = HealthRecords.parse(s.wakeTime),
+                      HealthSync.saneSleep(start, end) else { continue }
+                let minutes = Int(end.timeIntervalSince(start) / 60)
+                sleepSegments.append(SleepSegment(start: start, end: end, date: date, model: s,
+                                                  line: HealthSync.preciseLine(s.sleepLine ?? "", minutes: minutes)))
             }
             return
         }
         let list = VPDataBaseOperation.veepooSDKGetSleepData(withDate: date, andTableID: tableId) as? [[String: Any]] ?? []
         for item in list {
             guard let start = HealthRecords.parse(item["SLEEP_TIME"] as? String),
-                  let end = HealthRecords.parse(item["WAKE_TIME"] as? String), end > start else { continue }
+                  let end = HealthRecords.parse(item["WAKE_TIME"] as? String),
+                  HealthSync.saneSleep(start, end) else { continue }
             let deep = Int(((HealthRecords.double(item["DEEP_HOUR"]) ?? 0) * 60).rounded())
             let light = Int(((HealthRecords.double(item["LIGHT_HOUR"]) ?? 0) * 60).rounded())
             let total = (HealthRecords.int(item["SLE_HOUR"]) ?? 0) * 60 + (HealthRecords.int(item["SLE_MINUTE"]) ?? 0)
@@ -616,6 +613,80 @@ final class HealthSync {
             if (record["allSleep"] as? Int ?? 0) > 0 {
                 bag.put(HealthRecords.sleep, record, key: String(describing: record["startTime"]!))
             }
+        }
+    }
+
+    /// Drops corrupt segments (e.g. year 2039, months long): end after start,
+    /// at most 24 h, not in the future.
+    static func saneSleep(_ start: Date, _ end: Date) -> Bool {
+        end > start && end.timeIntervalSince(start) <= 24 * 3600 && start <= Date().addingTimeInterval(3600)
+    }
+
+    /// Joins linked segments (lastType / nextType) into one record per night:
+    /// start of the first, end of the last, curve joined (gaps = awake),
+    /// durations for the whole night, scores and other values of the last.
+    private func flushSleepNights() {
+        var seen = Set<Date>()
+        let segments = sleepSegments.sorted { $0.start < $1.start }.filter { seen.insert($0.start).inserted }
+        sleepSegments.removeAll()
+        var night: [SleepSegment] = []
+        for segment in segments {
+            if let previous = night.last, previous.linksNext || segment.linksPrevious, segment.start >= previous.end {
+                night.append(segment)
+            } else {
+                if !night.isEmpty { addSleepNight(night) }
+                night = [segment]
+            }
+        }
+        if !night.isEmpty { addSleepNight(night) }
+    }
+
+    private func addSleepNight(_ night: [SleepSegment]) {
+        guard let first = night.first, let last = night.last else { return }
+        var line = first.line
+        for (previous, segment) in zip(night, night.dropFirst()) {
+            let gap = Int(segment.start.timeIntervalSince(previous.end) / 60)
+            if gap > 0 { line += String(repeating: "4", count: gap) }
+            line += segment.line
+        }
+        let m = last.model
+        func sum(_ value: (VPAccurateSleepModel) -> String?) -> Int {
+            night.reduce(0) { $0 + (HealthRecords.int(value($1.model)) ?? 0) }
+        }
+        // Some firmwares put the whole night's totals in the last segment
+        // (longer than that segment itself); otherwise add the segments up.
+        let lastSpan = Int(last.end.timeIntervalSince(last.start) / 60)
+        let cumulative = night.count > 1 && (HealthRecords.int(m.sleepDuration) ?? 0) > lastSpan + 1
+        func total(_ value: @escaping (VPAccurateSleepModel) -> String?) -> Int {
+            cumulative ? (HealthRecords.int(value(m)) ?? 0) : sum(value)
+        }
+        let rem = line.filter { $0 == "2" }.count
+        var record: [String: Any] = [
+            "allSleep": total { $0.sleepDuration },
+            "deepSleep": total { $0.deepDuration },
+            "lightSleep": total { $0.lightDuration },
+            "rem": rem,
+            "awakeShort": total { $0.getUpDuration },
+            "startTime": Int64(first.start.timeIntervalSince1970 * 1000),
+            "endTime": Int64(last.end.timeIntervalSince1970 * 1000),
+            "sleep_date": last.date,
+            "sleep_line": line,
+            "segments": night.count,
+        ]
+        let ints: [(String, String?)] = [
+            ("sleep_quality", m.sleepQuality), ("wake_count", m.getUpTimes),
+            ("fall_asleep_score", m.fallAsleepScore), ("deep_score", m.deepScore),
+            ("sleep_efficiency_score", m.sleepEfficiencyScore), ("sleep_time_score", m.sleepTimeScore),
+            ("getup_score", m.getUpScore), ("insomnia_score", m.insomniaScore),
+            ("insomnia_times", m.insomniaTimes), ("insomnia_length", m.insomniaDuration),
+        ]
+        for (field, value) in ints {
+            if let v = HealthRecords.int(value) { record[field] = v }
+        }
+        NSLog("HBand sleep night %@ segments=%d cumulative=%d rem(line)=%d otherDuration=%d",
+              last.date, night.count, cumulative ? 1 : 0, rem, total { $0.otherDuration })
+        if (record["allSleep"] as? Int ?? 0) > 0 {
+            bag.put(HealthRecords.sleep, record, key: String(describing: record["startTime"]!))
         }
     }
 

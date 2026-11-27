@@ -446,33 +446,57 @@ class HealthSync(
 
             override fun onSleepProgress(p: Float) = progress("sleep", p)
             override fun onSleepProgressDetail(day: String?, packageNumber: Int) {}
-            override fun onReadSleepComplete() = done(null)
+            override fun onReadSleepComplete() {
+                // A night's segments can arrive under different days.
+                flushSleepNights()
+                done(null)
+            }
         }, readDays)
     }
 
     /**
-     * REM / awake minutes of a precise sleep curve. Newer firmware writes a hex
-     * string, 4 chars (16 bits) per minute, state = value >> 13: 0 deep, 1 light,
-     * 2 REM, 3 insomnia, 4 awake. Older ones write 1 char per minute (2 = REM, 4 = awake).
+     * Precise sleep curve → one digit per minute (0 deep, 1 light, 2 REM,
+     * 3 insomnia, 4 awake). Newer firmware writes a hex string, 4 chars
+     * (16 bits) per minute with state = value >> 13; older ones already write
+     * 1 char per minute. Both platforms send this same format.
      */
-    private fun preciseRemAwake(line: String, minutes: Int): Pair<Int, Int> {
-        if (minutes > 0 && line.length >= minutes * 2) {
-            val step = line.length / minutes
-            val states = (0..line.length - step step step).map { (line[it].digitToIntOrNull(16) ?: 0) shr 1 }
-            return states.count { it == 2 } to states.count { it == 4 }
+    private fun preciseLine(line: String, minutes: Int): String {
+        if (minutes <= 0 || line.length < minutes * 2) return line
+        val step = line.length / minutes
+        return (0..line.length - step step step).joinToString("") { i ->
+            minOf((line[i].digitToIntOrNull(16) ?: 0) shr 1, 4).toString()
         }
-        return line.count { it == '2' } to line.count { it == '4' }
     }
+
+    /** Drops corrupt segments (e.g. year 2039, months long): at most 24 h, not in the future. */
+    private fun saneSleep(start: Long, end: Long): Boolean =
+        end > start && end - start <= 24 * 3_600_000L && start <= System.currentTimeMillis() + 3_600_000L
+
+    private class SleepSegment(val start: Long, val end: Long, val data: SleepPrecisionData, val line: String) {
+        val linksPrevious get() = data.laster == 1
+        /** 255 = the watch does not know yet (night still going on). */
+        val linksNext get() = data.next == 1
+    }
+
+    /** Precise segments of every day read, joined into nights by [flushSleepNights]. */
+    private val sleepSegments = ArrayList<SleepSegment>()
 
     private fun onSleep(data: SleepData) {
         val start = HealthRecords.millis(data.sleepDown) ?: return
         val end = HealthRecords.millis(data.sleepUp) ?: return
-        if (end <= start || data.allSleepTime <= 0) return
+        if (!saneSleep(start, end) || data.allSleepTime <= 0) return
         val line = data.sleepLine ?: ""
+        if (data is SleepPrecisionData) {
+            sleepSegments += SleepSegment(start, end, data, preciseLine(line, ((end - start) / 60_000).toInt()))
+            return
+        }
+        // Normal curve: 1 char = 5 minutes; 2 = awake.
         val record = mutableMapOf<String, Any?>(
             "allSleep" to data.allSleepTime,
             "deepSleep" to data.deepSleepTime,
             "lightSleep" to data.lowSleepTime,
+            "rem" to 0,
+            "awakeShort" to line.count { it == '2' } * 5,
             "startTime" to start,
             "endTime" to end,
             "sleep_date" to data.date,
@@ -480,24 +504,71 @@ class HealthSync(
             "wake_count" to data.wakeCount,
             "sleep_line" to line,
         )
-        if (data is SleepPrecisionData) {
-            val (rem, awake) = preciseRemAwake(line, ((end - start) / 60_000).toInt())
-            record["rem"] = rem
-            record["awakeShort"] = awake
-            record["fall_asleep_score"] = data.fallAsleepScore
-            record["deep_score"] = data.deepScore
-            record["sleep_efficiency_score"] = data.sleepEfficiencyScore
-            record["sleep_time_score"] = data.sleepTimeScore
-            record["getup_score"] = data.getUpScore
-            record["insomnia_score"] = data.insomniaScore
-            record["insomnia_times"] = data.insomniaTimes
-            record["insomnia_length"] = data.insomniaLength
-        } else {
-            // Normal curve: 1 char = 5 minutes; 2 = awake.
-            record["rem"] = 0
-            record["awakeShort"] = line.count { it == '2' } * 5
-        }
         bag.put(SLEEP, record, key = start.toString())
+    }
+
+    /**
+     * Joins linked segments (laster / next) into one record per night: start
+     * of the first, end of the last, curve joined (gaps = awake), durations
+     * for the whole night, scores and other values of the last.
+     */
+    private fun flushSleepNights() {
+        val segments = sleepSegments.sortedBy { it.start }.distinctBy { it.start }
+        sleepSegments.clear()
+        var night = ArrayList<SleepSegment>()
+        for (segment in segments) {
+            val previous = night.lastOrNull()
+            if (previous != null && (previous.linksNext || segment.linksPrevious) && segment.start >= previous.end) {
+                night += segment
+            } else {
+                if (night.isNotEmpty()) addSleepNight(night)
+                night = arrayListOf(segment)
+            }
+        }
+        if (night.isNotEmpty()) addSleepNight(night)
+    }
+
+    private fun addSleepNight(night: List<SleepSegment>) {
+        val first = night.first()
+        val last = night.last()
+        val line = StringBuilder(first.line)
+        night.zipWithNext { previous, segment ->
+            val gap = ((segment.start - previous.end) / 60_000).toInt()
+            if (gap > 0) line.append("4".repeat(gap))
+            line.append(segment.line)
+        }
+        val d = last.data
+        // Some firmwares put the whole night's totals in the last segment
+        // (longer than that segment itself); otherwise add the segments up.
+        val lastSpan = ((last.end - last.start) / 60_000).toInt()
+        val cumulative = night.size > 1 && d.allSleepTime > lastSpan + 1
+        fun total(value: (SleepPrecisionData) -> Int) = if (cumulative) value(d) else night.sumOf { value(it.data) }
+        val rem = line.count { it == '2' }
+        val record = mutableMapOf<String, Any?>(
+            "allSleep" to total { it.allSleepTime },
+            "deepSleep" to total { it.deepSleepTime },
+            "lightSleep" to total { it.lowSleepTime },
+            "rem" to rem,
+            "awakeShort" to total { it.getUpDuration },
+            "startTime" to first.start,
+            "endTime" to last.end,
+            "sleep_date" to d.date,
+            "sleep_line" to line.toString(),
+            "segments" to night.size,
+            "sleep_quality" to d.sleepQulity,
+            "wake_count" to d.wakeCount,
+            "fall_asleep_score" to d.fallAsleepScore,
+            "deep_score" to d.deepScore,
+            "sleep_efficiency_score" to d.sleepEfficiencyScore,
+            "sleep_time_score" to d.sleepTimeScore,
+            "getup_score" to d.getUpScore,
+            "insomnia_score" to d.insomniaScore,
+            "insomnia_times" to d.insomniaTimes,
+            "insomnia_length" to d.insomniaLength,
+        )
+        Log.d(TAG, "sleep night ${d.date} segments=${night.size} cumulative=$cumulative " +
+            "rem(line)=$rem otherDuration=${total { it.otherDuration }}")
+        if (record["allSleep"] as Int > 0) bag.put(SLEEP, record, key = first.start.toString())
     }
 
     // ---- temperature (devices whose temperatureType != 5) ----
